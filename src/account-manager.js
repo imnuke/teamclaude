@@ -47,6 +47,13 @@ export class AccountManager {
    */
   getActiveAccount() {
     const current = this.accounts[this.currentIndex];
+    // We just learned a probed account's weekly quota — re-evaluate which
+    // account is best now that its limit is known.
+    if (current && current.requalify) {
+      current.requalify = false;
+      const next = this._selectNext();
+      if (next) return next;
+    }
     if (this._isAvailable(current)) {
       return current;
     }
@@ -125,7 +132,6 @@ export class AccountManager {
 
     for (let i = 0; i < this.accounts.length; i++) {
       const account = this.accounts[i];
-      if (i === this.currentIndex) continue;
       if (!this._isAvailable(account)) continue;
 
       // Unknown weekly reset sorts first so we fill it in.
@@ -137,8 +143,14 @@ export class AccountManager {
     }
 
     if (best) {
+      const switched = best.index !== this.currentIndex;
       this.currentIndex = best.index;
-      console.log(`[TeamClaude] Switched to account "${best.name}"`);
+      // If we switched to an account whose weekly quota is still unknown, flag
+      // it so we re-evaluate once that quota is learned (see updateQuota).
+      best.probing = best.quota.unified7dReset == null;
+      if (switched) {
+        console.log(`[TeamClaude] Switched to account "${best.name}"`);
+      }
       return best;
     }
 
@@ -186,6 +198,14 @@ export class AccountManager {
     const r7d = headers['anthropic-ratelimit-unified-7d-reset'];
     if (r5h) account.quota.unified5hReset = parseInt(r5h, 10) * 1000;
     if (r7d) account.quota.unified7dReset = parseInt(r7d, 10) * 1000;
+
+    // We switched to this account to discover its weekly quota; now that we
+    // know it, flag for re-evaluation so selection can pick the best account.
+    if (account.probing && account.quota.unified7dReset != null) {
+      account.probing = false;
+      account.requalify = true;
+      console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
+    }
 
     const uStatus = headers['anthropic-ratelimit-unified-status'];
     if (uStatus) account.quota.unifiedStatus = uStatus;
