@@ -9,6 +9,7 @@ import { createProxyServer } from './server.js';
 import { importCredentials, loginOAuth, fetchProfile, refreshAccessToken, isTokenExpiringSoon } from './oauth.js';
 import { sameIdentity, orgKey, matchAccounts } from './identity.js';
 import * as alias from './alias.js';
+import { ensureCerts } from './mitm.js';
 import { Prober } from './prober.js';
 import { TUI } from './tui.js';
 
@@ -415,9 +416,13 @@ async function envCommand() {
 async function runCommand() {
   const config = await loadOrCreateConfig();
 
-  // Everything after 'run' (skip -- separator if present)
-  const claudeArgs = args.slice(1);
-  if (claudeArgs[0] === '--') claudeArgs.shift();
+  // Args after 'run'. teamclaude flags (e.g. --mitm) are recognized only before
+  // an optional `--` separator; everything after `--` goes verbatim to claude.
+  const rest = args.slice(1);
+  const sep = rest.indexOf('--');
+  const tcFlags = sep >= 0 ? rest.slice(0, sep) : rest;
+  const useMitm = tcFlags.includes('--mitm');
+  const claudeArgs = sep >= 0 ? rest.slice(sep + 1) : rest.filter(a => a !== '--mitm');
 
   // Route through the proxy only when it's actually up; otherwise launch claude
   // directly so a stopped proxy doesn't break `claude`. This is what lets the
@@ -425,10 +430,23 @@ async function runCommand() {
   const port = config.proxy.port;
   const env = { ...process.env };
   if (await isProxyUp(port)) {
-    // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
-    // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
-    // lets Claude Code stay in subscription mode (full model access).
-    env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+    if (useMitm) {
+      // Route ALL of claude's traffic through us as an HTTPS forward proxy, so
+      // even hardcoded api.anthropic.com endpoints (e.g. the design MCP) get the
+      // real token injected. claude trusts our MITM leaf via NODE_EXTRA_CA_CERTS.
+      const host = upstreamHost(config);
+      const { caPath } = await ensureCerts(host);
+      const proxyUrl = `http://127.0.0.1:${port}`;
+      env.HTTPS_PROXY = env.HTTP_PROXY = env.https_proxy = env.http_proxy = proxyUrl;
+      env.NO_PROXY = env.no_proxy = ''; // ensure nothing (esp. the upstream host) bypasses us
+      env.NODE_EXTRA_CA_CERTS = caPath;
+      delete env.ANTHROPIC_BASE_URL;
+    } else {
+      // Only set ANTHROPIC_BASE_URL — Claude Code keeps its own OAuth token
+      // which the proxy accepts from localhost. Not setting ANTHROPIC_API_KEY
+      // lets Claude Code stay in subscription mode (full model access).
+      env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
+    }
   } else {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching claude directly (start it with: teamclaude server)`);
   }
@@ -838,7 +856,10 @@ Commands:
   login               OAuth login via browser
   login --api         Add an API key account
   env                 Print env vars to use with Claude
-  run [-- args...]    Run Claude Code through the proxy (direct if it's down)
+  run [--mitm] [-- args...]
+                      Run Claude Code through the proxy (direct if it's down);
+                      --mitm routes via an HTTPS forward proxy + local CA so even
+                      hardcoded api.anthropic.com endpoints are intercepted
   alias               Print a shell alias so plain 'claude' routes via the proxy
                       (--install to write it to your shell rc; --uninstall to remove)
   status              Show proxy & account status (live)
@@ -860,6 +881,10 @@ Options:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
   --headless          Run the server without the interactive TUI (for backgrounding)
+  --mitm              (run) route claude via the HTTPS forward proxy + local CA
+
+The server always accepts both base-URL and proxy/CONNECT clients, so instances
+launched with and without --mitm can share one server.
 
 A running server re-syncs accounts from config on POST /teamclaude/reload
 (local only). add/login/enable/disable/priority trigger it automatically.
@@ -1062,6 +1087,12 @@ async function resolveAccounts(config) {
 function argValue(flag) {
   const i = args.indexOf(flag);
   return (i >= 0 && args[i + 1]) ? args[i + 1] : null;
+}
+
+// Hostname of the configured upstream (the host MITM-intercepts under `run --mitm`).
+function upstreamHost(config) {
+  try { return new URL(config.upstream || 'https://api.anthropic.com').hostname; }
+  catch { return 'api.anthropic.com'; }
 }
 
 // Best-effort: tell a running server (if any) to re-sync accounts from config so
