@@ -15,6 +15,11 @@ on:
     branches: [master]
     paths:
       - 'package.json'
+  # Manual trigger: publish the version currently on master on demand. Useful to
+  # backfill a version that was bumped before this workflow existed, or to re-run
+  # after fixing the npm Trusted Publisher setup. The npm-view check below still
+  # gates it, so a manual run on an already-published version is a safe no-op.
+  workflow_dispatch:
 
 jobs:
   publish:
