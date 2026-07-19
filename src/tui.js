@@ -1,3 +1,4 @@
+import { createWriteStream } from 'node:fs';
 import { importCredentials, fetchProfile } from './oauth.js';
 import { sameIdentity } from './identity.js';
 
@@ -154,7 +155,7 @@ function timestamp() {
 // ── TUI class ────────────────────────────────────────────────
 
 export class TUI {
-  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null }) {
+  constructor({ accountManager, config, saveConfig, syncAccounts, onQuit, sx = null, probeQuota = null, activityLogPath = null }) {
     this.am = accountManager;
     this.config = config;
     this.saveConfig = saveConfig;
@@ -163,6 +164,8 @@ export class TUI {
     this.sx = sx;            // sx.org proxy manager (may be null)
     this.sxBalance = null;   // last fetched sx.org balance, for the settings screen
     this.probeQuota = probeQuota; // on-demand fleet-wide quota refresh (may be null)
+    this.activityLogPath = activityLogPath;
+    this._activityStream = null;
 
     this.log = [];           // completed activity entries
     this.active = new Map(); // in-flight requests
@@ -187,6 +190,14 @@ export class TUI {
 
   start() {
     this.running = true;
+    if (this.activityLogPath) {
+      this._activityStream = createWriteStream(this.activityLogPath, { flags: 'a' });
+      this._activityStream.on('error', err => {
+        // Swallow write errors — can't log them to the TUI without recursion
+        this._activityStream = null;
+        process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`);
+      });
+    }
     process.stdout.write(`${ESC}?1049h${ESC}?25l`);
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -213,6 +224,7 @@ export class TUI {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this._origLog) { console.log = this._origLog; console.error = this._origErr; }
+    if (this._activityStream) { this._activityStream.end(); this._activityStream = null; }
     process.stdin.removeListener('data', this._dataHandler);
     process.stdout.removeListener('resize', this._resizeHandler);
     process.stdout.write(`${ESC}?25h${ESC}?1049l`);
@@ -248,8 +260,10 @@ export class TUI {
 
   _addLog(msg) {
     msg = msg.replace(/^\[TeamClaude\]\s*/, '');
-    this.log.unshift({ t: timestamp(), msg });
+    const t = timestamp();
+    this.log.unshift({ t, msg });
     if (this.log.length > 200) this.log.length = 200;
+    if (this._activityStream) this._activityStream.write(`${t}  ${strip(msg)}\n`);
     if (this.running) this.render();
   }
 
