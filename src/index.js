@@ -141,7 +141,7 @@ async function serverCommand() {
   }
 
   const threshold = config.switchThreshold || 0.98;
-  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp });
+  const accountManager = new AccountManager(accounts, threshold, { routes: config.routes, ramp: config.stormRamp, distributeSessions: config.distributeSessions });
 
   // Restore quota observed in a previous run so a restart doesn't lose rotation
   // state (passive — we never call the API to re-learn it). Stale windows are
@@ -326,7 +326,8 @@ async function serverCommand() {
       const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
-      writeActivity(`${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+      const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
+      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;

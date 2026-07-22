@@ -194,7 +194,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       }
 
       const reqId = ++counter;
-      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url });
+      // Claude Code tags each session's requests with this header (present on
+      // /v1/messages and count_tokens). Read from headers up front so it drives
+      // session-aware routing (issue #109) and colors the TUI activity stream.
+      const sessionId = req.headers['x-claude-code-session-id'] || null;
+      hooks.onRequestStart?.(reqId, { method: req.method, path: req.url, sessionId });
 
       // Buffer request body (needed to resend on a different account after a 429).
       // Peek the top-level `model` field incrementally as chunks arrive so the
@@ -216,7 +220,11 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // nested in tools[]; the advisor sub-inference runs on the selected
       // account, so selection must be eligible for it too (issue #98).
       const advisorModel = parseAdvisorModel(body);
-      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs };
+      const ctx = { account: null, status: null, tried: new Set(), model, advisorModel, pinnedIndex, holdBudgetMs: holdMs, sessionId };
+      // Hold the session "in flight" across the WHOLE request (incl. retries and
+      // a multi-minute streaming completion) so it stays counted as active and
+      // never expires mid-request.
+      accountManager.beginSession(sessionId);
       try {
         await forwardRequest(req, res, body, accountManager, upstream, 0, hooks, reqId, ctx, logDir, sx);
       } catch (err) {
@@ -227,7 +235,8 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           res.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'Internal proxy error' } }));
         }
       } finally {
-        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model });
+        accountManager.endSession(sessionId);
+        hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: ctx.account, status: ctx.status, model: ctx.model, sessionId });
       }
     } catch (err) {
       console.error('[TeamClaude] Unhandled error:', err);
@@ -444,7 +453,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // and the caller gets the exhausted response rather than leaking to another.
   const account = ctx.pinnedIndex != null
     ? (ctx.tried.has(ctx.pinnedIndex) ? null : accountManager.accounts[ctx.pinnedIndex])
-    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel);
+    : accountManager.getActiveAccount(ctx.tried, ctx.model, ctx.advisorModel, ctx.sessionId);
   if (!account) {
     // A pinned request concerns exactly one account: don't compute a fleet-wide
     // retry-after or sleep on other accounts' windows — return immediately.
@@ -505,6 +514,9 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
   // Track which account handles this request
   ctx.account = account.name;
+  // Pin this session to the serving account (for affinity) and keep it "active"
+  // in the running-sessions readout. Passive when distribution is off.
+  accountManager.recordSession(ctx.sessionId, account.index);
   hooks.onRequestRouted?.(reqId, { account: account.name });
 
   // Refresh OAuth token if needed
