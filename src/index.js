@@ -2,6 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { createWriteStream } from 'node:fs';
 import net from 'node:net';
 import { loadOrCreateConfig, loadConfig, saveConfig, atomicConfigUpdate, getConfigPath, loadState, saveState } from './config.js';
 import { AccountManager } from './account-manager.js';
@@ -118,6 +119,9 @@ async function serverCommand() {
   // --log-to <dir>
   const logTo = argValue('--log-to');
   if (logTo) config.logDir = logTo;
+
+  // --activity-log <file>
+  const activityLogPath = argValue('--activity-log') || null;
 
   if (config.accounts.length === 0) {
     console.error('No accounts configured.\n');
@@ -252,7 +256,7 @@ async function serverCommand() {
 
   if (useTUI) {
     tui = new TUI({
-      accountManager, config, sx,
+      accountManager, config, sx, activityLogPath,
       saveConfig: () => atomicConfigUpdate(async diskConfig => {
         // Write in-memory accounts as the authoritative state, preserving
         // extra disk-only fields (e.g. importFrom) where the account still exists.
@@ -292,6 +296,42 @@ async function serverCommand() {
       onRequestRouted: (id, info) => tui.onRequestRouted(id, info),
       onRequestEnd: (id, info) => tui.onRequestEnd(id, info),
     };
+  }
+
+  // In headless mode, wire activity-log writes directly via hooks + console.
+  if (!tui && activityLogPath) {
+    const aStream = createWriteStream(activityLogPath, { flags: 'a' });
+    aStream.on('error', err => process.stderr.write(`[TeamClaude] activity log error: ${err.message}\n`));
+    const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
+    const writeActivity = msg => {
+      // Strip [TeamClaude] prefix to match TUI behaviour
+      aStream.write(`${ts()}  ${msg.replace(/^\[TeamClaude\]\s*/, '')}\n`);
+    };
+    // Capture request completions via the hook
+    const inFlight = new Map();
+    hooks.onRequestStart = (id, info) => inFlight.set(id, { ...info, started: Date.now() });
+    hooks.onRequestModel = (id, info) => {
+      const r = inFlight.get(id);
+      if (r && info.model) r.model = info.model;
+    };
+    hooks.onRequestRouted = (id, info) => {
+      const r = inFlight.get(id);
+      if (r) r.account = info.account;
+    };
+    hooks.onRequestEnd = (id, info) => {
+      const r = inFlight.get(id);
+      inFlight.delete(id);
+      const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
+      const acct = info.account || r?.account || '?';
+      const model = info.model ? ` (${info.model})` : '';
+      writeActivity(`${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+    };
+    // Tee console output to the activity log as well
+    const origLog = console.log;
+    const origErr = console.error;
+    console.log = (...a) => { const m = a.join(' '); origLog(m); writeActivity(m); };
+    console.error = (...a) => { const m = a.join(' '); origErr(m); writeActivity(m); };
+    process.on('exit', () => aStream.end());
   }
 
   // Expose reload to the proxy's control endpoint (works with or without TUI).
@@ -1191,6 +1231,7 @@ Options:
   --json JSON         Import from inline JSON (import), e.g.:
                       --json '{"accessToken":"...","refreshToken":"...","expiresAt":1234}'
   --log-to DIR        Log full requests/responses to DIR (server, one file per request)
+  --activity-log FILE Append TUI activity lines to FILE (server; works in headless mode too)
   --headless          Run the server without the interactive TUI (for backgrounding)
   --no-mitm           (run) skip the forward proxy; route via ANTHROPIC_BASE_URL only
   --auto-fallback     (run) if the proxy is down, launch claude directly instead
