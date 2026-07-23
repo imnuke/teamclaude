@@ -327,7 +327,8 @@ async function serverCommand() {
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
       const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
-      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct} (${info.status}, ${dur}s)`);
+      const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
+      writeActivity(`${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;
